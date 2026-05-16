@@ -1,0 +1,14 @@
+[platform]
+name = "AgentsVillage"
+
+[llm]
+provider = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+model = "tencent/hy3-preview"
+timeout_secs = 60
+
+[discord]
+application_id = "YOUR_APPLICATION_ID"
+guild_id = "YOUR_GUILD_ID"
+channel_id = "YOUR_CHANNEL_ID"
+channel_name = "unknown"

@@ -1,0 +1,73 @@
+* 用 Rust 实现以下 Agent 平台主程序
+
+1 从项目根路径加载 `config.toml`。
+
+2 如果 `config.toml` 不存在、为空、格式错误，或缺少必要的非敏感配置，则进入命令行初始化流程。
+  注意：`config.toml` 只保存非敏感配置（如 LLM 提供商名称、默认模型、超时时间等）。敏感凭证（`DISCORD_TOKEN`、`LLM_API_KEY` 等）存放在项目根目录的 `.env` 文件中，程序启动时通过环境变量读取。`.env` 文件必须加入 `.gitignore`，不得提交到版本控制。
+
+3 初始化 Agent 平台基础信息
+3.1 提示用户输入 Agent 平台名称，该名称可用于 Discord Bot 显示、日志和默认 Agent 描述。
+3.2 提示用户选择 LLM 提供商，当前支持 OpenRouter 和 Ollama。
+3.3 根据 LLM 提供商收集连接参数，例如 base URL、model 名称。API key 等敏感凭证不写入 `config.toml`，而是引导用户写入项目根目录的 `.env` 文件（例如 `LLM_API_KEY=sk-xxx`）。
+3.4 发送测试请求验证 LLM 参数：使用固定简单 prompt（如 `"Hello"`）调用 LLM 的 chat completion 接口，期望获得非空的成功响应；若失败则提示用户检查 `.env` 中的 API key 以及 `config.toml` 中的 base URL 是否正确。
+3.5 测试失败则提示用户重新输入；测试成功则将非敏感配置（LLM 提供商名称、base URL、model 名称、超时时间等）写入 `config.toml`。
+
+4 初始化 Discord Application/Bot
+4.1 提示用户进入 Discord Developer Portal 创建 Application 和 Bot。
+4.2 提示用户复制 Bot token，并将其写入项目根目录的 `.env` 文件（`DISCORD_TOKEN=xxx`），而非写入 `config.toml`。
+4.3 因为本平台需要读取频道普通消息，必须提示用户在 Bot 页面启用 `MESSAGE_CONTENT` Privileged Gateway Intent。
+4.4 提示用户复制 Application/Client ID（非敏感，可写入 `config.toml`）。
+4.5 程序生成 OAuth2 安装链接，scopes 使用 `bot applications.commands`。
+4.6 Bot 权限至少请求 View Channel、Send Messages、Read Message History；如果支持 threads，再请求 Create Public Threads 和 Send Messages in Threads。
+4.7 提示用户通过 OAuth2 链接把 Bot 安装到 Discord Server/Guild。注意：Discord Bot 不是"添加到某个 Channel"，而是安装到 Server，再由频道权限决定它能访问哪些 Channel。
+
+5 绑定 Discord 频道
+5.1 提示用户打开 Discord 开发者模式。
+5.2 程序优先调用 Discord REST API 列出 Bot 可见的服务器（Guild）和频道（Channel）列表，让用户通过数字序号选择目标 Guild 和 Channel；若列表获取失败或用户希望手动指定，则允许直接输入 Guild ID 和 Channel ID 作为备选方案。
+5.3 调用 Discord REST API 验证 Bot token 是否有效。
+5.4 调用 `GET /channels/{channel.id}` 验证频道存在且 Bot 可见。
+5.5 尝试发送测试消息或 typing indicator，验证 Bot 具备写入权限。
+5.6 测试失败时区分 token 错误、Bot 未安装、频道 ID 错误、频道权限不足，并要求用户重新输入或调整权限。
+5.7 测试成功后，把 Discord application ID、guild ID、channel ID、channel name、enabled intents 等非敏感信息写入 `config.toml`；Bot token 保留在 `.env` 文件中，不写入 `config.toml`。
+
+6 建立 Discord Gateway 连接
+6.1 使用 Discord API v10。
+6.2 Gateway intents 至少包含 `GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | GUILD_MESSAGE_TYPING`；为支持 Thread，还需包含处理 Thread 相关事件所需的 intent（如 `GUILD_MESSAGE_TYPING` 已涵盖部分场景，确保 `GUILDS` intent 包含 Thread 可见性）。
+6.3 连接 Gateway 后处理 Hello、Heartbeat、Identify、Ready。
+6.4 保存 session ID、resume gateway URL 和最后收到的 sequence number，用于断线重连和 resume。
+6.5 优先使用成熟 Rust Discord 库处理 Gateway、REST、rate limit 和 reconnect 细节。
+6.6 程序启动时，扫描 `workspace/` 目录，为每个符合命名规范（`discord-<guild_id>-<channel_id>` 或 `discord-<guild_id>-<channel_id>-<thread_id>`）的子目录自动加载对应的 Agent 实例，读取其 `role.md`、`memory.md`、`config.toml`（若存在），恢复 Agent 状态，无需用户重新初始化。
+
+7 创建 Agent
+7.1 默认采用"一个 Discord Channel 或 Thread 对应一个 Agent"的模型。
+7.2 Agent ID 使用稳定格式 `discord-<guild_id>-<channel_id>[-<thread_id>]`（`thread_id` 可选，用于区分 Thread 级 Agent）；显示名使用 Discord channel/thread name。
+7.3 参考 `skills/create-agent.md` 创建 Agent。本计划（`ai-prompts.txt`）第 7 节的规格为权威实现规格，`skills/create-agent.md` 作为辅助参考；两者描述冲突时，以本计划为准。
+7.4 在 `workspace/<agent-id>/` 下创建 `role.md`、`memory.md`、`sessions/`。
+7.5 config.toml 采用两级结构：
+    - **全局 `config.toml`**（项目根目录）：初始化完成后写入平台级非敏感配置，如 LLM 提供商名称、默认模型、base URL、超时时间等。
+    - **Agent 级 `config.toml`**（`workspace/<agent-id>/config.toml`）：可选，用于覆盖全局配置中的特定字段（如为某个 Agent 指定不同的模型）。加载时将 Agent 级配置合并到全局配置之上，Agent 级优先。若 Agent 目录下不存在 `config.toml`，则完全继承全局配置。
+    此两级结构消除了"若 `config.toml` 为空则进入初始化"与"Agent 继承全局配置"之间的歧义：前者仅针对全局 `config.toml`，后者描述 Agent 级配置的继承行为。
+
+8 Discord 消息路由
+8.1 监听目标 Channel 的 `MESSAGE_CREATE` 事件。
+8.2 忽略 Bot 自己发送的消息，避免自我回复循环。
+8.3 读取用户消息内容；如果 content 为空，提示检查 `MESSAGE_CONTENT` intent 是否启用。
+8.4 检测 `MESSAGE_CREATE` 事件是否来自 Thread：若消息的 `channel_id` 对应一个 Thread（可通过 channel type 判断），则使用该 `thread_id` 作为 Agent 定位依据，Agent ID 格式为 `discord-<guild_id>-<channel_id>-<thread_id>`；否则使用普通 Channel 格式 `discord-<guild_id>-<channel_id>`。根据解析出的 Agent ID 查找对应 Agent；不存在则自动创建。
+8.5 监听 `THREAD_CREATE` 事件：当新 Thread 被创建时，可为其预先准备 Agent 实例（创建对应的 `workspace/` 子目录及初始文件），以便首条消息到达时无需临时创建。
+8.6 将用户消息、作者、channel/thread ID、timestamp 写入当日 session 文件。
+8.7 上下文管理策略：每次向 LLM 发送请求时，只使用最近 20 条消息作为上下文窗口。当消息总数超过 20 条时，将最旧的消息批次通过 LLM 生成摘要，追加写入该 Agent 的 `memory.md`（长期记忆）。每次构建 LLM 请求时，将 `memory.md` 的内容作为系统提示的一部分注入，确保长期记忆不丢失。
+8.8 调用已配置的 LLM 生成回复。
+8.9 通过 Discord REST API 回复到同一频道或 Thread。
+8.10 处理 Discord 单条消息 2000 字符限制，必要时拆分回复。
+
+9 任务安排
+9.1 用户可以通过 Discord 与 Agent 聊天。
+9.2 第一版可把"安排任务"的自然语言请求记录到 session，并由 Agent 回复确认。
+9.3 在架构层面预留独立模块处理 `INTERACTION_CREATE` 事件，将 Slash 命令路由与普通消息路由（`MESSAGE_CREATE`）分离；该模块负责解析 Slash 命令并分发到对应处理器，为未来实现 `/agent status`、`/agent role`、`/agent reset`、`/task add` 等命令做准备。
+9.4 后续再扩展独立调度器或管理命令，例如 `/agent status`、`/agent role`、`/agent reset`、`/task add`。
+
+10 安全与错误处理
+10.1 不自动化普通 Discord 用户账号，只使用 Bot API。
+10.2 日志中隐藏 LLM API key 和 Discord Bot token。
+10.3 处理 Discord rate limits、权限变化、频道删除、token 失效、Gateway 断线、LLM 调用失败。
+10.4 当 Discord 连接或 LLM 调用失败时，在命令行和 Discord 频道中返回可理解的错误信息。
