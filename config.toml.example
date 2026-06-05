@@ -1,3 +1,8 @@
+[core]
+# Number of recent messages to keep in LLM context window (default: 20)
+# Per-agent override: add [core] context_window = N to workspace/{agent_id}/config.toml
+context_window = 20
+
 [platform]
 name = "AgentsVillage"
 

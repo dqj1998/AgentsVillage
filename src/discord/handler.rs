@@ -1,40 +1,34 @@
+// This handler delegates message and command execution to AppService.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serenity::model::application::Interaction;
-use serenity::model::channel::{ChannelType, GuildChannel, Message};
+use serenity::model::channel::{GuildChannel, Message};
 use serenity::model::gateway::Ready;
 use serenity::model::guild::Guild;
-use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use crate::agent::{AgentManager, MemoryManager};
-use crate::config::GlobalConfig;
-use crate::llm::LlmClient;
+use crate::agent::AgentManager;
+use crate::app::{service::AppService, AppRequest, AppResponse, RequestPayload};
 
-use super::router::{build_agent_id, build_llm_messages, current_timestamp, split_message};
-
-const CONTEXT_WINDOW: usize = 20;
+use super::adapter::{
+    app_response_to_text, build_agent_id, current_timestamp, get_channel_name, get_thread_id,
+    split_message,
+};
 
 pub struct DiscordHandler {
     pub agent_manager: Arc<Mutex<AgentManager>>,
-    pub llm_client: Arc<LlmClient>,
-    #[allow(dead_code)]
-    pub config: GlobalConfig,
+    pub app_service: Arc<AppService>,
 }
 
 impl DiscordHandler {
-    pub fn new(
-        agent_manager: Arc<Mutex<AgentManager>>,
-        llm_client: Arc<LlmClient>,
-        config: GlobalConfig,
-    ) -> Self {
+    pub fn new(agent_manager: Arc<Mutex<AgentManager>>, app_service: Arc<AppService>) -> Self {
         Self {
             agent_manager,
-            llm_client,
-            config,
+            app_service,
         }
     }
 }
@@ -45,10 +39,9 @@ impl EventHandler for DiscordHandler {
         info!("Discord bot connected as: {}", ready.user.name);
 
         // Register slash commands with Discord
-        let commands = vec![
-            serenity::builder::CreateCommand::new("new")
-                .description("Start a fresh conversation (clears today's session, keeps long-term memory)"),
-        ];
+        let commands = vec![serenity::builder::CreateCommand::new("new").description(
+            "Start a fresh conversation (clears today's session, keeps long-term memory)",
+        )];
 
         match ctx.http.create_global_commands(&commands).await {
             Ok(registered) => {
@@ -91,7 +84,8 @@ impl EventHandler for DiscordHandler {
         let agent_id = build_agent_id(guild_id, channel_id, thread_id);
 
         // Get channel/thread display name
-        let display_name = get_channel_name(&ctx, msg.channel_id).await
+        let display_name = get_channel_name(&ctx, msg.channel_id)
+            .await
             .unwrap_or_else(|| format!("channel-{}", channel_id));
 
         info!(
@@ -102,75 +96,37 @@ impl EventHandler for DiscordHandler {
             &msg.content[..msg.content.len().min(50)]
         );
 
-        // Get or create agent
-        let agent = {
-            let mut manager = self.agent_manager.lock().await;
-            match manager.get_or_create_agent(&agent_id, &display_name).await {
-                Ok(a) => a.clone(),
-                Err(e) => {
-                    error!("Failed to get/create agent {}: {}", agent_id, e);
-                    return;
-                }
-            }
+        let request = AppRequest {
+            agent_id: agent_id.clone(),
+            platform_user: msg.author.name.clone(),
+            timestamp: current_timestamp(),
+            payload: RequestPayload::Message(msg.content.clone()),
         };
 
-        let memory_manager = MemoryManager::new(agent.workspace_path.clone());
-        let timestamp = current_timestamp();
-
-        // Append user message to session
-        if let Err(e) = memory_manager
-            .append_session(&msg.author.name, &msg.content, &timestamp)
-            .await
-        {
-            warn!("Failed to append user message to session: {}", e);
-        }
-
-        // Build LLM context
-        let llm_messages = match build_llm_messages(
-            &agent,
-            &memory_manager,
-            &self.llm_client,
-            CONTEXT_WINDOW,
-        )
-        .await
-        {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                error!("Failed to build LLM messages: {}", e);
-                return;
-            }
-        };
-
-        // Show typing indicator
         let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
 
-        // Call LLM
-        let response = match self.llm_client.chat(llm_messages).await {
-            Ok(r) => r,
+        match self.app_service.handle(request).await {
+            Ok(response) => {
+                if let AppResponse::Error(text) = &response {
+                    error!("AppService error response: {}", text);
+                }
+
+                let chunks = split_message(app_response_to_text(&response), 2000);
+                for chunk in chunks {
+                    if let Err(e) = msg.channel_id.say(&ctx.http, &chunk).await {
+                        error!("Failed to send message to Discord: {}", e);
+                    }
+                }
+            }
             Err(e) => {
-                error!("LLM call failed: {}", e);
+                error!("AppService handle error: {}", e);
                 let _ = msg
                     .channel_id
-                    .say(&ctx.http, "Sorry, I encountered an error processing your message.")
+                    .say(
+                        &ctx.http,
+                        "Sorry, I encountered an error processing your message.",
+                    )
                     .await;
-                return;
-            }
-        };
-
-        // Append assistant response to session
-        let assistant_timestamp = current_timestamp();
-        if let Err(e) = memory_manager
-            .append_session("assistant", &response, &assistant_timestamp)
-            .await
-        {
-            warn!("Failed to append assistant response to session: {}", e);
-        }
-
-        // Send response to Discord (handle 2000 char limit)
-        let chunks = split_message(&response, 2000);
-        for chunk in chunks {
-            if let Err(e) = msg.channel_id.say(&ctx.http, &chunk).await {
-                error!("Failed to send message to Discord: {}", e);
             }
         }
     }
@@ -185,7 +141,7 @@ impl EventHandler for DiscordHandler {
 
         info!("New thread created: {} (agent: {})", display_name, agent_id);
 
-        // Pre-create agent instance for the new thread
+        // Pre-create the agent instance for the new thread.
         let mut manager = self.agent_manager.lock().await;
         match manager.get_or_create_agent(&agent_id, &display_name).await {
             Ok(_) => {
@@ -227,51 +183,52 @@ impl EventHandler for DiscordHandler {
                     let thread_id = get_thread_id(&ctx, command.channel_id).await;
                     let agent_id = build_agent_id(guild_id, channel_id, thread_id);
 
-                    // Get agent workspace path
-                    let workspace_path = {
-                        let mut manager = self.agent_manager.lock().await;
-                        match manager.get_or_create_agent(&agent_id, &format!("channel-{}", channel_id)).await {
-                            Ok(agent) => agent.workspace_path.clone(),
-                            Err(e) => {
-                                error!("Failed to get agent for /new: {}", e);
-                                let _ = command
-                                    .create_response(
-                                        &ctx.http,
-                                        serenity::builder::CreateInteractionResponse::Message(
-                                            serenity::builder::CreateInteractionResponseMessage::new()
-                                                .content("❌ Failed to find agent for this channel.")
-                                                .ephemeral(true),
-                                        ),
-                                    )
-                                    .await;
-                                return;
-                            }
-                        }
+                    let request = AppRequest {
+                        agent_id: agent_id.clone(),
+                        platform_user: command.user.name.clone(),
+                        timestamp: current_timestamp(),
+                        payload: RequestPayload::Command {
+                            name: "new".to_string(),
+                            args: vec![],
+                        },
                     };
 
-                    let memory_manager = MemoryManager::new(workspace_path);
-                    match memory_manager.clear_today_session().await {
-                        Ok(()) => {
-                            info!("Cleared today's session for agent {}", agent_id);
+                    match self.app_service.handle(request).await {
+                        Ok(AppResponse::Ephemeral(text)) | Ok(AppResponse::Text(text)) => {
                             let _ = command
                                 .create_response(
                                     &ctx.http,
                                     serenity::builder::CreateInteractionResponse::Message(
                                         serenity::builder::CreateInteractionResponseMessage::new()
-                                            .content("🆕 Started a new conversation! Today's session has been cleared. Long-term memory is preserved.")
+                                            .content(text)
+                                            .ephemeral(true),
+                                    ),
+                                )
+                                .await;
+                        }
+                        Ok(AppResponse::Error(text)) => {
+                            error!("AppService /new error: {}", text);
+                            let _ = command
+                                .create_response(
+                                    &ctx.http,
+                                    serenity::builder::CreateInteractionResponse::Message(
+                                        serenity::builder::CreateInteractionResponseMessage::new()
+                                            .content(format!("❌ {}", text))
                                             .ephemeral(true),
                                     ),
                                 )
                                 .await;
                         }
                         Err(e) => {
-                            error!("Failed to clear session for /new: {}", e);
+                            error!("AppService /new handle error: {}", e);
                             let _ = command
                                 .create_response(
                                     &ctx.http,
                                     serenity::builder::CreateInteractionResponse::Message(
                                         serenity::builder::CreateInteractionResponseMessage::new()
-                                            .content("❌ Failed to clear session. Please try again.")
+                                            .content(
+                                                "❌ Failed to clear session. Please try again.",
+                                            )
                                             .ephemeral(true),
                                     ),
                                 )
@@ -293,49 +250,6 @@ impl EventHandler for DiscordHandler {
                         .await;
                 }
             }
-        }
-    }
-}
-
-/// Get thread ID if the channel is a thread
-async fn get_thread_id(ctx: &Context, channel_id: ChannelId) -> Option<u64> {
-    // Try REST API to get channel info
-    match ctx.http.get_channel(channel_id).await {
-        Ok(channel) => {
-            // In serenity 0.12, Channel is an enum: Guild(GuildChannel) or Private(PrivateChannel)
-            if let Some(guild_channel) = channel.guild() {
-                match guild_channel.kind {
-                    ChannelType::PublicThread
-                    | ChannelType::PrivateThread
-                    | ChannelType::NewsThread => Some(channel_id.get()),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        }
-        Err(e) => {
-            warn!("Failed to get channel info for {}: {}", channel_id, e);
-            None
-        }
-    }
-}
-
-/// Get channel display name
-async fn get_channel_name(ctx: &Context, channel_id: ChannelId) -> Option<String> {
-    // Try cache first using guild channels
-    // Fall back to REST API
-    match ctx.http.get_channel(channel_id).await {
-        Ok(channel) => {
-            if let Some(guild_channel) = channel.guild() {
-                Some(guild_channel.name.clone())
-            } else {
-                None
-            }
-        }
-        Err(e) => {
-            warn!("Failed to get channel name for {}: {}", channel_id, e);
-            None
         }
     }
 }

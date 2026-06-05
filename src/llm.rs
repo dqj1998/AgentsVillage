@@ -5,6 +5,12 @@ use tracing::debug;
 
 use crate::config::LlmConfig;
 
+/// Trait for LLM backends — allows test mocks without a real HTTP server.
+#[async_trait::async_trait]
+pub trait LlmBackend: Send + Sync {
+    async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String>;
+}
+
 pub struct LlmClient {
     config: LlmConfig,
     api_key: Option<String>,
@@ -53,27 +59,19 @@ impl LlmClient {
         }
     }
 
-    pub async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String> {
+    pub async fn chat_inner(&self, messages: Vec<ChatMessage>) -> Result<String> {
         let base_url = self
             .config
             .base_url
             .as_deref()
             .unwrap_or("http://localhost:11434");
-        let model = self
-            .config
-            .model
-            .as_deref()
-            .unwrap_or("llama3")
-            .to_string();
+        let model = self.config.model.as_deref().unwrap_or("llama3").to_string();
 
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
         debug!("Calling LLM at {} with model {}", url, model);
 
-        let body = ChatRequest {
-            model,
-            messages,
-        };
+        let body = ChatRequest { model, messages };
 
         let mut request = self.http.post(&url).json(&body);
 
@@ -121,12 +119,19 @@ impl LlmClient {
             content: "Hello".to_string(),
         }];
 
-        let response = self.chat(messages).await?;
+        let response = self.chat_inner(messages).await?;
         if response.is_empty() {
             anyhow::bail!("LLM returned empty response during test");
         }
 
         debug!("LLM test connection successful");
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmBackend for LlmClient {
+    async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String> {
+        self.chat_inner(messages).await
     }
 }

@@ -7,7 +7,13 @@ use tracing::info;
 use crate::llm::LlmClient;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CoreConfig {
+    pub context_window: Option<usize>, // number of recent messages to include, default 20
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GlobalConfig {
+    pub core: CoreConfig,
     pub platform: PlatformConfig,
     pub llm: LlmConfig,
     pub discord: DiscordConfig,
@@ -38,6 +44,7 @@ pub struct DiscordConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentOverrideConfig {
     pub llm: Option<LlmConfig>,
+    pub core: Option<CoreConfig>,
 }
 
 pub fn load_global_config() -> Result<GlobalConfig> {
@@ -46,15 +53,13 @@ pub fn load_global_config() -> Result<GlobalConfig> {
         return Ok(GlobalConfig::default());
     }
 
-    let content = std::fs::read_to_string(config_path)
-        .context("Failed to read config.toml")?;
+    let content = std::fs::read_to_string(config_path).context("Failed to read config.toml")?;
 
     if content.trim().is_empty() {
         return Ok(GlobalConfig::default());
     }
 
-    let config: GlobalConfig = toml::from_str(&content)
-        .context("Failed to parse config.toml")?;
+    let config: GlobalConfig = toml::from_str(&content).context("Failed to parse config.toml")?;
 
     Ok(config)
 }
@@ -70,10 +75,8 @@ pub fn is_config_complete(config: &GlobalConfig) -> bool {
 }
 
 pub fn save_global_config(config: &GlobalConfig) -> Result<()> {
-    let content = toml::to_string_pretty(config)
-        .context("Failed to serialize config")?;
-    std::fs::write("config.toml", content)
-        .context("Failed to write config.toml")?;
+    let content = toml::to_string_pretty(config).context("Failed to serialize config")?;
+    std::fs::write("config.toml", content).context("Failed to write config.toml")?;
     info!("Config saved to config.toml");
     Ok(())
 }
@@ -98,8 +101,141 @@ pub fn merge_agent_config(
                 merged.llm.timeout_secs = llm_override.timeout_secs;
             }
         }
+        if let Some(core_override) = override_cfg.core {
+            if core_override.context_window.is_some() {
+                merged.core.context_window = core_override.context_window;
+            }
+        }
     }
     merged
+}
+
+/// Return the configured context window size, defaulting to 20 if not set.
+pub fn effective_context_window(config: &GlobalConfig) -> usize {
+    config.core.context_window.unwrap_or(20)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_global_config() -> GlobalConfig {
+        GlobalConfig {
+            core: CoreConfig::default(),
+            platform: PlatformConfig {
+                name: Some("TestPlatform".to_string()),
+            },
+            llm: LlmConfig {
+                provider: Some("openrouter".to_string()),
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                model: Some("openai/gpt-4o-mini".to_string()),
+                timeout_secs: Some(30),
+            },
+            discord: DiscordConfig {
+                application_id: Some("app-123".to_string()),
+                guild_id: Some("guild-456".to_string()),
+                channel_id: Some("chan-789".to_string()),
+                channel_name: Some("general".to_string()),
+                intents: None,
+            },
+        }
+    }
+
+    #[test]
+    fn merge_agent_config_no_override_returns_global_unchanged() {
+        let global = base_global_config();
+        let merged = merge_agent_config(&global, None);
+
+        assert_eq!(merged.llm.provider, global.llm.provider);
+        assert_eq!(merged.llm.base_url, global.llm.base_url);
+        assert_eq!(merged.llm.model, global.llm.model);
+        assert_eq!(merged.llm.timeout_secs, global.llm.timeout_secs);
+        assert_eq!(merged.platform.name, global.platform.name);
+        assert_eq!(merged.discord.guild_id, global.discord.guild_id);
+    }
+
+    #[test]
+    fn merge_agent_config_model_override_only_changes_model() {
+        let global = base_global_config();
+        let override_cfg = AgentOverrideConfig {
+            llm: Some(LlmConfig {
+                model: Some("anthropic/claude-3-haiku".to_string()),
+                provider: None,
+                base_url: None,
+                timeout_secs: None,
+            }),
+            core: None,
+        };
+
+        let merged = merge_agent_config(&global, Some(override_cfg));
+
+        // Only model should change
+        assert_eq!(
+            merged.llm.model,
+            Some("anthropic/claude-3-haiku".to_string())
+        );
+        // Everything else preserved
+        assert_eq!(merged.llm.provider, Some("openrouter".to_string()));
+        assert_eq!(
+            merged.llm.base_url,
+            Some("https://openrouter.ai/api/v1".to_string())
+        );
+        assert_eq!(merged.llm.timeout_secs, Some(30));
+        assert_eq!(merged.platform.name, Some("TestPlatform".to_string()));
+    }
+
+    #[test]
+    fn merge_agent_config_partial_override_only_base_url_changes() {
+        let global = base_global_config();
+        let override_cfg = AgentOverrideConfig {
+            llm: Some(LlmConfig {
+                base_url: Some("http://localhost:11434".to_string()),
+                provider: None,
+                model: None,
+                timeout_secs: None,
+            }),
+            core: None,
+        };
+
+        let merged = merge_agent_config(&global, Some(override_cfg));
+
+        // Only base_url should change
+        assert_eq!(
+            merged.llm.base_url,
+            Some("http://localhost:11434".to_string())
+        );
+        // Everything else preserved
+        assert_eq!(merged.llm.provider, Some("openrouter".to_string()));
+        assert_eq!(merged.llm.model, Some("openai/gpt-4o-mini".to_string()));
+        assert_eq!(merged.llm.timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn merge_agent_config_full_llm_override_replaces_all_llm_fields() {
+        let global = base_global_config();
+        let override_cfg = AgentOverrideConfig {
+            llm: Some(LlmConfig {
+                provider: Some("ollama".to_string()),
+                base_url: Some("http://localhost:11434".to_string()),
+                model: Some("llama3".to_string()),
+                timeout_secs: Some(60),
+            }),
+            core: None,
+        };
+
+        let merged = merge_agent_config(&global, Some(override_cfg));
+
+        assert_eq!(merged.llm.provider, Some("ollama".to_string()));
+        assert_eq!(
+            merged.llm.base_url,
+            Some("http://localhost:11434".to_string())
+        );
+        assert_eq!(merged.llm.model, Some("llama3".to_string()));
+        assert_eq!(merged.llm.timeout_secs, Some(60));
+        // Non-LLM fields still from global
+        assert_eq!(merged.platform.name, Some("TestPlatform".to_string()));
+        assert_eq!(merged.discord.guild_id, Some("guild-456".to_string()));
+    }
 }
 
 pub async fn run_init_wizard() -> Result<GlobalConfig> {
@@ -194,6 +330,7 @@ pub async fn run_init_wizard() -> Result<GlobalConfig> {
     }
 
     let mut config = GlobalConfig {
+        core: CoreConfig::default(),
         platform: PlatformConfig {
             name: Some(platform_name),
         },
@@ -252,8 +389,7 @@ pub async fn run_init_wizard() -> Result<GlobalConfig> {
     println!("\n=== Channel Binding ===\n");
 
     // Load token from env
-    let discord_token = std::env::var("DISCORD_TOKEN")
-        .unwrap_or_else(|_| _bot_token.clone());
+    let discord_token = std::env::var("DISCORD_TOKEN").unwrap_or_else(|_| _bot_token.clone());
 
     let (guild_id, channel_id, channel_name) =
         run_channel_binding_wizard(&discord_token, &app_id).await?;
@@ -296,9 +432,7 @@ async fn run_channel_binding_wizard(
 
     let guild_id = if guilds.is_empty() {
         println!("No guilds found. Please enter Guild ID manually.");
-        Input::new()
-            .with_prompt("Enter Guild ID")
-            .interact_text()?
+        Input::new().with_prompt("Enter Guild ID").interact_text()?
     } else {
         let guild_names: Vec<String> = guilds
             .iter()
@@ -321,14 +455,9 @@ async fn run_channel_binding_wizard(
             .interact()?;
 
         if choice == guilds.len() {
-            Input::new()
-                .with_prompt("Enter Guild ID")
-                .interact_text()?
+            Input::new().with_prompt("Enter Guild ID").interact_text()?
         } else {
-            guilds[choice]["id"]
-                .as_str()
-                .unwrap_or("")
-                .to_string()
+            guilds[choice]["id"].as_str().unwrap_or("").to_string()
         }
     };
 

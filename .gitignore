@@ -11,6 +11,10 @@ target
 # Runtime configuration with real IDs/secrets - use config.toml.example as template
 config.toml
 
+# Local editor and OS files
+.DS_Store
+.vscode/
+
 # Agent workspace - contains runtime data and real Discord IDs
 workspace/
 

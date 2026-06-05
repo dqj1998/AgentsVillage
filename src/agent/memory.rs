@@ -24,12 +24,7 @@ impl MemoryManager {
     }
 
     /// Append message to today's session file: workspace/{agent_id}/sessions/YYYY-MM-DD.md
-    pub async fn append_session(
-        &self,
-        author: &str,
-        content: &str,
-        timestamp: &str,
-    ) -> Result<()> {
+    pub async fn append_session(&self, author: &str, content: &str, timestamp: &str) -> Result<()> {
         let sessions_dir = self.workspace_path.join("sessions");
         fs::create_dir_all(&sessions_dir)
             .await
@@ -45,10 +40,7 @@ impl MemoryManager {
             "user"
         };
 
-        let entry = format!(
-            "## {} | {}: {}\n{}\n\n",
-            timestamp, role, author, content
-        );
+        let entry = format!("## {} | {}: {}\n{}\n\n", timestamp, role, author, content);
 
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -162,7 +154,9 @@ impl MemoryManager {
         Ok(())
     }
 
-    /// Count total messages across all session files
+    /// Count messages in today's session file only.
+    /// Note: This is a pragmatic fix for the O(n) IO debt — full history counting
+    /// is being replaced by EventLog-based state tracking.
     pub async fn count_total_messages(&self) -> Result<usize> {
         let sessions_dir = self.workspace_path.join("sessions");
 
@@ -170,33 +164,30 @@ impl MemoryManager {
             return Ok(0);
         }
 
-        let mut entries = fs::read_dir(&sessions_dir)
-            .await
-            .context("Failed to read sessions directory")?;
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let session_file = sessions_dir.join(format!("{}.md", today));
 
-        let mut total = 0usize;
+        if !session_file.exists() {
+            return Ok(0);
+        }
 
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".md") {
-                let file_path = sessions_dir.join(&name);
-                let content = fs::read_to_string(&file_path)
-                    .await
-                    .unwrap_or_default();
-                // Count "## " headers as message markers
-                total += content.matches("\n## ").count();
-                if content.starts_with("## ") {
-                    total += 1;
-                }
-            }
+        let content = fs::read_to_string(&session_file).await.unwrap_or_default();
+
+        // Count "## " headers as message markers
+        let mut total = content.matches("\n## ").count();
+        if content.starts_with("## ") {
+            total += 1;
         }
 
         Ok(total)
     }
 }
 
-/// Parse session file content into SessionMessage list
-fn parse_session_file(content: &str) -> Vec<SessionMessage> {
+/// Parse session file content into SessionMessage list.
+/// Known limitation: user messages containing "\n## " on a line by itself
+/// will cause incorrect splitting. This is tracked as technical debt.
+/// The timestamp guard (must start with a digit) reduces false positives.
+pub(crate) fn parse_session_file(content: &str) -> Vec<SessionMessage> {
     let mut messages = Vec::new();
 
     // Split on "## " headers
@@ -231,6 +222,18 @@ fn parse_session_file(content: &str) -> Vec<SessionMessage> {
         }
 
         let timestamp = parts[0].trim().to_string();
+
+        // Timestamp guard: must start with a digit (e.g. "2024-...") to reduce
+        // false positives from "## " appearing inside message bodies.
+        if !timestamp
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
         let role_author = parts[1].trim();
 
         // Parse "role: author"
@@ -251,4 +254,192 @@ fn parse_session_file(content: &str) -> Vec<SessionMessage> {
     }
 
     messages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // ── parse_session_file unit tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_session_file_empty_returns_empty_vec() {
+        let result = parse_session_file("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_session_file_single_entry_parses_correctly() {
+        let content = "## 2024-01-15 10:30:00 UTC | user: Alice\nHello there!\n\n";
+        let messages = parse_session_file(content);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].author, "Alice");
+        assert_eq!(messages[0].content, "Hello there!");
+        assert_eq!(messages[0].timestamp, "2024-01-15 10:30:00 UTC");
+    }
+
+    #[test]
+    fn parse_session_file_multiple_entries_parse_correctly() {
+        let content = concat!(
+            "## 2024-01-15 10:30:00 UTC | user: Alice\nHello!\n\n",
+            "## 2024-01-15 10:31:00 UTC | assistant: Bot\nHi Alice!\n\n",
+            "## 2024-01-15 10:32:00 UTC | user: Alice\nHow are you?\n\n",
+        );
+        let messages = parse_session_file(content);
+        assert_eq!(messages.len(), 3);
+
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].author, "Alice");
+        assert_eq!(messages[0].content, "Hello!");
+
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].author, "Bot");
+        assert_eq!(messages[1].content, "Hi Alice!");
+
+        assert_eq!(messages[2].role, "user");
+        assert_eq!(messages[2].author, "Alice");
+        assert_eq!(messages[2].content, "How are you?");
+    }
+
+    /// Documents the known fragile parsing behavior: a "## " inside the message
+    /// body causes the parser to split on it, treating the body fragment as a
+    /// new (malformed) header and silently dropping it.  This test captures the
+    /// *current* (wrong) behavior so we know when it changes.
+    #[test]
+    fn parse_session_file_double_hash_in_body_documents_current_behavior() {
+        let content = concat!(
+            "## 2024-01-15 10:30:00 UTC | user: Alice\n",
+            "Here is a heading:\n## Sub-section\nMore text\n\n",
+        );
+        let messages = parse_session_file(content);
+        // Current behavior: the "## Sub-section" inside the body causes a split.
+        // The first entry's content is truncated to just "Here is a heading:".
+        // The fragment "Sub-section\nMore text" fails header parsing and is dropped.
+        // So we end up with 1 message whose content does NOT include "Sub-section".
+        assert_eq!(
+            messages.len(),
+            1,
+            "current behavior: body ## causes split → 1 msg"
+        );
+        assert_eq!(messages[0].author, "Alice");
+        assert!(
+            !messages[0].content.contains("Sub-section"),
+            "current behavior: Sub-section is lost due to fragile parsing"
+        );
+    }
+
+    // ── MemoryManager integration tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn memory_manager_append_and_load_round_trip() {
+        let dir = tempdir().unwrap();
+        let mm = MemoryManager::new(dir.path().to_path_buf());
+
+        mm.append_session("Alice", "First message", "2024-01-15 10:00:00 UTC")
+            .await
+            .unwrap();
+        mm.append_session("Bot", "Second message", "2024-01-15 10:01:00 UTC")
+            .await
+            .unwrap();
+        mm.append_session("Alice", "Third message", "2024-01-15 10:02:00 UTC")
+            .await
+            .unwrap();
+
+        let messages = mm.load_recent_messages(10).await.unwrap();
+        assert_eq!(messages.len(), 3, "expected 3 messages back");
+
+        // Chronological order
+        assert_eq!(messages[0].content, "First message");
+        assert_eq!(messages[1].content, "Second message");
+        assert_eq!(messages[2].content, "Third message");
+    }
+
+    #[tokio::test]
+    async fn memory_manager_load_recent_messages_respects_limit() {
+        let dir = tempdir().unwrap();
+        let mm = MemoryManager::new(dir.path().to_path_buf());
+
+        for i in 0..5 {
+            mm.append_session(
+                "Alice",
+                &format!("Message {}", i),
+                "2024-01-15 10:00:00 UTC",
+            )
+            .await
+            .unwrap();
+        }
+
+        let messages = mm.load_recent_messages(2).await.unwrap();
+        assert_eq!(messages.len(), 2, "limit=2 should return only 2 messages");
+        // Should be the 2 most recent (messages 3 and 4)
+        assert_eq!(messages[0].content, "Message 3");
+        assert_eq!(messages[1].content, "Message 4");
+    }
+
+    #[tokio::test]
+    async fn memory_manager_clear_today_session_truncates_file() {
+        let dir = tempdir().unwrap();
+        let mm = MemoryManager::new(dir.path().to_path_buf());
+
+        mm.append_session("Alice", "Hello", "2024-01-15 10:00:00 UTC")
+            .await
+            .unwrap();
+
+        // Verify there's something there
+        let before = mm.load_recent_messages(10).await.unwrap();
+        assert!(!before.is_empty());
+
+        mm.clear_today_session().await.unwrap();
+
+        let after = mm.load_recent_messages(10).await.unwrap();
+        assert!(
+            after.is_empty(),
+            "after clear, no messages should be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_manager_count_total_messages_correct() {
+        let dir = tempdir().unwrap();
+        let mm = MemoryManager::new(dir.path().to_path_buf());
+
+        let count_before = mm.count_total_messages().await.unwrap();
+        assert_eq!(count_before, 0);
+
+        for i in 0..4 {
+            mm.append_session("Alice", &format!("Msg {}", i), "2024-01-15 10:00:00 UTC")
+                .await
+                .unwrap();
+        }
+
+        let count_after = mm.count_total_messages().await.unwrap();
+        assert_eq!(count_after, 4);
+    }
+
+    #[tokio::test]
+    async fn memory_manager_read_and_append_memory_round_trip() {
+        let dir = tempdir().unwrap();
+        let mm = MemoryManager::new(dir.path().to_path_buf());
+
+        // Initially empty
+        let initial = mm.read_memory().await.unwrap();
+        assert!(initial.is_empty());
+
+        mm.append_memory("Key fact: the sky is blue.")
+            .await
+            .unwrap();
+        mm.append_memory("Key fact: water is wet.").await.unwrap();
+
+        let content = mm.read_memory().await.unwrap();
+        assert!(
+            content.contains("Key fact: the sky is blue."),
+            "first summary should be present"
+        );
+        assert!(
+            content.contains("Key fact: water is wet."),
+            "second summary should be present"
+        );
+    }
 }

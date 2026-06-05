@@ -1,0 +1,155 @@
+schema_version: 1
+platform: agents_village
+pipeline:
+  - channel_adapter
+  - app_request
+  - intent_compiler
+  - agent_manifest
+  - execution_engine
+  - app_response
+  - channel_delivery
+schema_layers:
+  - platform
+  - intents
+  - executors
+  - audit
+  - memory
+  - channels
+  - workspace_manifest
+intents:
+  schema_version: 1
+  intents:
+    - name: chat
+      enabled_by_default: true
+      trigger: message
+      input_fields:
+        - user_text
+        - author
+        - agent_id
+        - channel_ref
+      execution:
+        executor: chat_executor
+        steps:
+          - name: persist_user_message
+            effect: session.append
+            audit: chat_started
+          - name: render_prompt
+            effect: prompt.render
+            audit:
+          - name: call_llm
+            effect: llm.chat
+            audit:
+          - name: persist_assistant_message
+            effect: session.append
+            audit: chat_completed
+      failure:
+        audit: chat_failed
+        response: error_message
+      audit:
+        required_events:
+          - chat_started
+          - chat_completed
+          - chat_failed
+        include_fields:
+          - timestamp
+          - agent_id
+          - channel_ref
+          - author
+          - user_text_len
+          - response_len
+          - error
+    - name: reset_session
+      enabled_by_default: true
+      trigger: explicit_command
+      input_fields:
+        - agent_id
+        - channel_ref
+        - command_name
+      execution:
+        executor: chat_executor
+        steps:
+          - name: clear_today_session
+            effect: session.clear_today
+            audit: reset_session
+      failure:
+        audit: chat_failed
+        response: error_message
+      audit:
+        required_events:
+          - reset_session
+        include_fields:
+          - timestamp
+          - agent_id
+          - channel_ref
+          - reason
+executors:
+  schema_version: 1
+  executors:
+    - name: chat_executor
+      allowed_effects:
+        - session.append
+        - session.clear_today
+        - prompt.render
+        - llm.chat
+        - memory.append_summary
+        - event_log.append
+      required_audit_events:
+        - chat_started
+        - chat_completed
+        - chat_failed
+        - reset_session
+        - memory_summarized
+audit:
+  schema_version: 1
+  required_fields:
+    - timestamp
+  events:
+    - name: chat_started
+      required_fields:
+        - timestamp
+        - author
+        - user_text_len
+    - name: chat_completed
+      required_fields:
+        - timestamp
+        - response_len
+    - name: chat_failed
+      required_fields:
+        - timestamp
+        - error
+    - name: reset_session
+      required_fields:
+        - timestamp
+        - reason
+    - name: memory_summarized
+      required_fields:
+        - timestamp
+        - messages_summarized
+memory:
+  schema_version: 1
+  effects:
+    - name: session.append
+      path: sessions/YYYY-MM-DD.md
+      audit:
+    - name: session.clear_today
+      path: sessions/YYYY-MM-DD.md
+      audit: reset_session
+    - name: memory.append_summary
+      path: memory.md
+      audit: memory_summarized
+channels:
+  - schema_version: 1
+    kind: discord
+    capabilities:
+      split_long_messages: true
+      max_message_length: 2000
+      supports_ephemeral: true
+      typing_indicator: true
+    routing_policy:
+      create_agent_on_first_message: true
+      route_mentions_only: false
+      allow_thread_agents: true
+    external_ref_fields:
+      - guild_id
+      - channel_id
+      - thread_id

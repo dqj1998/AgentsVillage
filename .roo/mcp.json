@@ -1,0 +1,14 @@
+{
+	"mcpServers": {
+		"mda-guide": {
+			"command": "/Users/qingjie.du/HDD/MCPOrb/target/orbs/mda-guide.orb",
+			"args": [
+				"--stdio-gui"
+			],
+			"alwaysAllow": [
+				"search_knowledge",
+				"get_web_ui_url"
+			]
+		}
+	}
+}
